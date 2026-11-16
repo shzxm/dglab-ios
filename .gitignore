@@ -8,6 +8,7 @@ Builds/
 *.dSYM/
 *.log
 *.png.log
+DGLab-simulator-*.png
 
 # Local (unpublished) reference copy of the companion Bot repository
 ReferenceBot/
