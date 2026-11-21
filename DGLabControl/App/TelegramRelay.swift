@@ -149,7 +149,11 @@ final class TelegramRelay: ObservableObject {
                 catch { pending.removeValue(forKey: id)?.resume(throwing: error) }
             }
             Task {
-                try? await Task.sleep(nanoseconds: 9_000_000_000)
+                // Host confirmation / BLE scan can take tens of seconds.
+                // A 9-second blanket timeout incorrectly reported valid
+                // device.connect/session.arm operations as startup failures.
+                let seconds: UInt64 = (command == "device.connect" || command == "session.arm") ? 70 : 15
+                try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
                 pending.removeValue(forKey: id)?.resume(throwing: DGControlError.requestTimedOut)
             }
         }
