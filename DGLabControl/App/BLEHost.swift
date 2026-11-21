@@ -19,6 +19,7 @@ final class BLEHost: NSObject, ObservableObject, @preconcurrency CBCentralManage
     @Published private(set) var status = "蓝牙初始化中"
     @Published private(set) var detected: [DetectedDGLab] = []
     @Published private(set) var isScanning = false
+    @Published private(set) var isConnecting = false
     @Published private(set) var connected = false
     @Published private(set) var battery: Int? = nil
     @Published private(set) var strengthA = 0
@@ -34,6 +35,7 @@ final class BLEHost: NSObject, ObservableObject, @preconcurrency CBCentralManage
     private var waveAChar: CBCharacteristic?
     private var waveBChar: CBCharacteristic?
     private var batteryChar: CBCharacteristic?
+    private var connectWatchdog: Task<Void, Never>?
     private var playing: [DGChannel: Task<Void, Never>] = [:]
     private var generations: [DGChannel: Int] = [.A: 0, .B: 0]
     private var modulation: [DGChannel: WaveModulation] = [:]
@@ -51,11 +53,17 @@ final class BLEHost: NSObject, ObservableObject, @preconcurrency CBCentralManage
         }
     }
     func scan() {
+        guard !isConnecting else { return }
         guard central.state == .poweredOn else { status = "请检查蓝牙权限"; return }
+        lastError = nil
         stopScan()
         detected = []; isScanning = true
         central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
-        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in self?.stopScan() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in
+            guard let self, self.isScanning else { return }
+            self.stopScan()
+            if self.detected.isEmpty { self.status = "扫描结束，未发现 DG-LAB（请检查是否被其他主机连接）" }
+        }
     }
     func stopScan() { if isScanning { central.stopScan(); isScanning = false } }
     func centralManager(_ central: CBCentralManager, didDiscover device: CBPeripheral,
@@ -66,34 +74,64 @@ final class BLEHost: NSObject, ObservableObject, @preconcurrency CBCentralManage
         detected.append(.init(id: device.identifier, peripheral: device, name: name, rssi: RSSI.intValue))
     }
     func connect(to item: DetectedDGLab) {
-        guard !connected else { return }
+        guard !connected && !isConnecting else { return }
+        guard central.state == .poweredOn else {
+            lastError = "蓝牙未就绪，请授权蓝牙并打开系统蓝牙"
+            return
+        }
         stopScan()
+        lastError = nil
         faulted = false
+        isConnecting = true
         peripheral = item.peripheral
         peripheral?.delegate = self
         status = "连接 \(item.name)…"
         central.connect(item.peripheral, options: nil)
+        let deviceId = item.id
+        connectWatchdog?.cancel()
+        connectWatchdog = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 20_000_000_000)
+            guard let self, !Task.isCancelled, self.isConnecting,
+                  self.peripheral?.identifier == deviceId else { return }
+            self.lastError = "连接或服务发现超过 20 秒。检查蓝牙权限、设备距离，以及是否被 Mac 占用。"
+            self.status = "设备未连接（超时）"
+            self.central.cancelPeripheralConnection(item.peripheral)
+            self.hardReset()
+        }
     }
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         status = "读取 DG-LAB 服务…"
         peripheral.discoverServices([CBUUID(string: V2Codec.serviceUUID), CBUUID(string: V2Codec.batteryServiceUUID)])
     }
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        guard self.peripheral?.identifier == peripheral.identifier else { return }
         lastError = error?.localizedDescription ?? "蓝牙连接失败"
+        status = "设备未连接"
         hardReset()
     }
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        guard self.peripheral?.identifier == peripheral.identifier else { return }
         let wasActive = armed
         hardReset()
         status = "设备已断开"
         if wasActive { onUnexpectedDisconnect?() }
     }
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        if let error { lastError = error.localizedDescription; return }
-        for service in peripheral.services ?? [] { peripheral.discoverCharacteristics(nil, for: service) }
+        if let error {
+            failConnect("发现 BLE 服务失败：\(error.localizedDescription)")
+            return
+        }
+        guard let services = peripheral.services, !services.isEmpty else {
+            failConnect("设备未提供 BLE 服务，请检查是否为 DG-LAB V2")
+            return
+        }
+        for service in services { peripheral.discoverCharacteristics(nil, for: service) }
     }
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        if let error { lastError = error.localizedDescription; return }
+        if let error {
+            failConnect("读取 BLE 特征失败：\(error.localizedDescription)")
+            return
+        }
         for characteristic in service.characteristics ?? [] {
             let uuid = characteristic.uuid.uuidString.uppercased()
             switch uuid {
@@ -109,6 +147,8 @@ final class BLEHost: NSObject, ObservableObject, @preconcurrency CBCentralManage
             // Fail-safe initialization: zero both channels and send zero wave frames.
             sendZeroPackets()
             strengthA = 0; strengthB = 0; connected = true
+            isConnecting = false
+            connectWatchdog?.cancel(); connectWatchdog = nil
             status = "已连接（未授权输出）"
         }
     }
@@ -200,7 +240,15 @@ final class BLEHost: NSObject, ObservableObject, @preconcurrency CBCentralManage
         if let peripheral { central.cancelPeripheralConnection(peripheral) }
         hardReset()
     }
+    private func failConnect(_ reason: String) {
+        lastError = reason
+        status = "设备未连接"
+        if let peripheral { central.cancelPeripheralConnection(peripheral) }
+        hardReset()
+    }
     private func hardReset() {
+        connectWatchdog?.cancel(); connectWatchdog = nil
+        isConnecting = false
         armed = false
         faulted = false
         for channel in DGChannel.allCases {

@@ -57,6 +57,7 @@ final class TelegramRelay: ObservableObject {
     // Per-user network address: never bake a developer's LAN IP into public code.
     @Published var endpoint = UserDefaults.standard.string(forKey: "DGLabRelayEndpoint") ?? ""
     @Published private(set) var connected = false
+    @Published private(set) var connecting = false
     @Published private(set) var connectionLabel = "未连接 Telegram 桥接"
     @Published private(set) var relayStatus = RelayStatus()
     @Published private(set) var assignedRole: ControlRole = .remote
@@ -68,18 +69,33 @@ final class TelegramRelay: ObservableObject {
     private var socket: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
+    private var connectionWatchdog: Task<Void, Never>?
     private var pending: [String: CheckedContinuation<[String: Any], Error>] = [:]
     private var connectingRole: ControlRole = .remote
     private var intentionalDisconnect = false
 
     func connect(role: ControlRole, token: String) throws {
         guard role != .standalone else { throw DGControlError.rejected }
-        guard let url = URL(string: endpoint), ["ws", "wss"].contains(url.scheme?.lowercased() ?? ""),
-              let host = url.host, !host.isEmpty, !token.isEmpty else { throw DGControlError.relayDisconnected }
-        // Plain WS allowed only on local / private networks. Internet connections must use TLS.
+        let trimmed = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed), ["ws", "wss"].contains(url.scheme?.lowercased() ?? ""),
+              let host = url.host, !host.isEmpty, url.port != nil else {
+            throw NSError(domain: "DGLabRelay", code: 400, userInfo:
+                [NSLocalizedDescriptionKey: "请填写完整的 Mac 桥接地址，如 ws://192.168.1.x:8788"])
+        }
+        guard token.utf8.count >= 32 else {
+            throw NSError(domain: "DGLabRelay", code: 401, userInfo:
+                [NSLocalizedDescriptionKey: "桥接密钥至少 32 字节，且必须与 Mac 正在运行的控制器相同"])
+        }
+        // Plain WS is permitted ONLY on RFC1918/LAN and .local hosts.
         if url.scheme?.lowercased() == "ws" {
-            let isLocal = host == "localhost" || host.hasSuffix(".local") || host.hasPrefix("192.168.") || host.hasPrefix("10.") || host.hasPrefix("172.16.") || host.hasPrefix("172.17.")
-            guard isLocal else { throw DGControlError.rejected }
+            let octets = host.split(separator: ".").compactMap { Int($0) }
+            let privateIPv4 = octets.count == 4 && octets.allSatisfy { (0...255).contains($0) } &&
+                (octets[0] == 10 || (octets[0] == 192 && octets[1] == 168) ||
+                 (octets[0] == 172 && (16...31).contains(octets[1])))
+            guard privateIPv4 || host.hasSuffix(".local") else {
+                throw NSError(domain: "DGLabRelay", code: 403,
+                    userInfo: [NSLocalizedDescriptionKey: "明文 ws:// 仅允许局域网私有地址。公网连接请使用 wss://"])
+            }
         }
         UserDefaults.standard.set(endpoint, forKey: "DGLabRelayEndpoint")
         disconnect()
@@ -92,7 +108,16 @@ final class TelegramRelay: ObservableObject {
         let socket = URLSession(configuration: .default).webSocketTask(with: request)
         self.socket = socket
         socket.resume()
-        connectionLabel = "正在连接…"
+        connecting = true
+        connectionLabel = "正在连接 Mac 桥接…"
+        lastMessage = ""
+        let currentSocket = socket
+        connectionWatchdog = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard let self, !Task.isCancelled, !self.connected,
+                  self.socket === currentSocket else { return }
+            self.markDisconnected(reason: "连接超过 15 秒。检查 Mac 桥接 8788、局域网、旧服务冲突及密钥是否一致。")
+        }
         receiveTask = Task { [weak self] in await self?.receiveLoop(socket) }
         pingTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -103,7 +128,10 @@ final class TelegramRelay: ObservableObject {
                 }
             }
         }
-        Task { try? await send(["type": "hello", "role": role == .host ? "host" : "remote", "platform": "ios"]) }
+        Task { [weak self] in
+            do { try await self?.send(["type": "hello", "role": role == .host ? "host" : "remote", "platform": "ios"]) }
+            catch { self?.markDisconnected(reason: "桥接握手失败：\(error.localizedDescription)") }
+        }
     }
     private func send(_ payload: [String: Any]) async throws {
         guard let socket else { throw DGControlError.relayDisconnected }
@@ -141,6 +169,8 @@ final class TelegramRelay: ObservableObject {
                       let type = item["type"] as? String else { continue }
                 switch type {
                 case "ready":
+                    connecting = false
+                    connectionWatchdog?.cancel(); connectionWatchdog = nil
                     connected = true; assignedRole = connectingRole
                     connectionLabel = connectingRole == .host ? "已连接 · iPhone 蓝牙主机" : "已连接 · Telegram 控制"
                 case "snapshot":
@@ -159,8 +189,9 @@ final class TelegramRelay: ObservableObject {
                 default: break
                 }
             } catch {
-                if !intentionalDisconnect { lastMessage = "连接中断：\(error.localizedDescription)" }
-                markDisconnected(); return
+                let explanation = "连接失败：\(error.localizedDescription)。请检查 ws/wss 地址、Mac 监听地址与桥接密钥。"
+                markDisconnected(reason: intentionalDisconnect ? nil : explanation)
+                return
             }
         }
     }
@@ -202,15 +233,21 @@ final class TelegramRelay: ObservableObject {
         socket?.cancel(with: .normalClosure, reason: nil)
         markDisconnected()
     }
-    private func markDisconnected() {
+    private func markDisconnected(reason: String? = nil) {
         let wasHost = assignedRole == .host && connected
         connected = false
+        connecting = false
+        socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         receiveTask?.cancel(); receiveTask = nil
         pingTask?.cancel(); pingTask = nil
+        connectionWatchdog?.cancel(); connectionWatchdog = nil
         for (_, completion) in pending { completion.resume(throwing: DGControlError.relayDisconnected) }
         pending.removeAll()
-        connectionLabel = "桥接未连接"
+        if let reason {
+            connectionLabel = "桥接连接失败"
+            lastMessage = reason
+        } else { connectionLabel = "桥接未连接" }
         if wasHost { onHostDisconnected?() }
     }
 }

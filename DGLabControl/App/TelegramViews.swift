@@ -19,11 +19,18 @@ struct TelegramPage: View {
                         .textContentType(.URL).keyboardType(.URL)
                     SecureField("独立桥接密钥（不是 Bot Token）", text: $secret)
                     HStack {
-                        Button("作为蓝牙主机连接") { connect(.host) }.buttonStyle(.borderedProminent)
-                        Button("远程控制 Bot") { connect(.remote) }.buttonStyle(.bordered)
+                        Button(c.bridge.connecting ? "连接中…" : "作为蓝牙主机连接") { connect(.host) }
+                            .buttonStyle(.borderedProminent).disabled(c.bridge.connecting)
+                        Button("远程控制 Bot") { connect(.remote) }
+                            .buttonStyle(.bordered).disabled(c.bridge.connecting)
                     }.font(.caption)
                     if c.bridge.connected { Button("断开桥接") { c.bridge.disconnect() }.tint(.red) }
                     Text(c.bridge.connectionLabel).font(.caption).foregroundStyle(.secondary)
+                    if !c.bridge.lastMessage.isEmpty {
+                        Text(c.bridge.lastMessage).font(.caption).foregroundStyle(.orange)
+                    }
+                    Text("只有 Mac 正在运行的那一套控制器能够接受当前连接。新版 Mac App 的桥接密钥和旧 Node 控制器并不自动同步。")
+                        .font(.caption2).foregroundStyle(.secondary)
                 }.dgCard()
                 if c.bridge.connected { remoteActions }
                 VStack(alignment: .leading, spacing: 10) {

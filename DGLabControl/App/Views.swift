@@ -14,24 +14,32 @@ extension View {
 
 struct MainNavigation: View {
     @EnvironmentObject private var c: DGLabController
+    @State private var selectedTab = 0
     var body: some View {
-        TabView {
-            NavigationStack { DashboardPage() }.tabItem { Label("总览", systemImage: "square.grid.2x2.fill") }
-            NavigationStack { ManualControlPage() }.tabItem { Label("控制", systemImage: "slider.horizontal.3") }
-            NavigationStack { WaveformsPage() }.tabItem { Label("波形", systemImage: "waveform.path") }
-            NavigationStack { SoundPage() }.tabItem { Label("声控", systemImage: "waveform") }
-            NavigationStack { TelegramPage() }.tabItem { Label("Telegram", systemImage: "paperplane.fill") }
-            NavigationStack { SettingsPage() }.tabItem { Label("设置", systemImage: "gearshape.fill") }
+        TabView(selection: $selectedTab) {
+            NavigationStack { DashboardPage(selectedTab: $selectedTab) }.tabItem { Label("总览", systemImage: "square.grid.2x2.fill") }.tag(0)
+            NavigationStack { ManualControlPage() }.tabItem { Label("控制", systemImage: "slider.horizontal.3") }.tag(1)
+            NavigationStack { WaveformsPage() }.tabItem { Label("波形", systemImage: "waveform.path") }.tag(2)
+            NavigationStack { SoundPage() }.tabItem { Label("声控", systemImage: "waveform") }.tag(3)
+            NavigationStack { TelegramPage() }.tabItem { Label("Telegram", systemImage: "paperplane.fill") }.tag(4)
+            NavigationStack { SettingsPage() }.tabItem { Label("设置", systemImage: "gearshape.fill") }.tag(5)
         }
-        .alert("Telegram 请求授权控制设备", isPresented: $c.hostApprovalNeeded) {
-            Button("拒绝", role: .cancel) { c.rejectHostControl() }
-            Button("仅本次授权") { c.approveHostControl() }
+        // One alert coordinator: competing .alert modifiers can suppress the
+        // critical iPhone-side host authorization sheet on some SwiftUI builds.
+        .alert(c.hostApprovalNeeded ? "Telegram 请求授权控制设备" : "操作提示",
+               isPresented: Binding(get: { c.hostApprovalNeeded || c.errorMessage != nil },
+                                    set: { if !$0 && !c.hostApprovalNeeded { c.errorMessage = nil } })) {
+            if c.hostApprovalNeeded {
+                Button("拒绝", role: .cancel) { c.rejectHostControl() }
+                Button("仅本次授权") { c.approveHostControl() }
+            } else {
+                Button("知道了", role: .cancel) { c.errorMessage = nil }
+            }
         } message: {
-            Text("请确认 DG-LAB 已连接且处于你身边。此操作将允许 Telegram 在本地上限范围内控制 A/B 通道。")
+            Text(c.hostApprovalNeeded
+                ? "请确认 DG-LAB 已连接且在你身边，Telegram 只能在本机设置的 A/B 上限内请求操作。"
+                : (c.errorMessage ?? ""))
         }
-        .alert("操作提示", isPresented: Binding(get: { c.errorMessage != nil }, set: { if !$0 { c.errorMessage = nil } })) {
-            Button("知道了", role: .cancel) { c.errorMessage = nil }
-        } message: { Text(c.errorMessage ?? "") }
     }
 }
 
@@ -60,6 +68,13 @@ struct MetricBlock: View {
 
 struct DashboardPage: View {
     @EnvironmentObject private var c: DGLabController
+    @Binding var selectedTab: Int
+    @State private var showStartConfirmation = false
+
+    private var canStartLocal: Bool {
+        c.ble.connected && (c.capA > 0 || c.capB > 0) && !c.active
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 17) {
@@ -75,6 +90,50 @@ struct DashboardPage: View {
                     StatusChip(text: c.ble.connected ? "蓝牙已连接" : "蓝牙未连接", online: c.ble.connected)
                     Spacer(minLength: 4)
                     StatusChip(text: c.active ? "会话进行中" : "会话已停止", online: c.active)
+                }.dgCard()
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("启动与连接").font(.headline)
+                    if c.role == .standalone {
+                        Button(c.active ? "会话进行中" : "启动本地控制会话") {
+                            if !c.ble.connected {
+                                c.report("尚未连接蓝牙设备，正在扫描；请从下方设备列表点击连接")
+                                c.ble.scan()
+                            } else if c.capA == 0 && c.capB == 0 {
+                                c.report("A/B 上限都是零。请先在「控制」页面设置至少一个通道上限。")
+                                selectedTab = 1
+                            } else { showStartConfirmation = true }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(c.active || c.ble.isConnecting)
+                        Label(c.ble.connected ? "第 1 步：设备已连接" : "第 1 步：请先扫描并连接 DG-LAB 蓝牙", systemImage: c.ble.connected ? "checkmark.circle.fill" : "1.circle")
+                            .font(.subheadline)
+                        if !c.ble.connected {
+                            Button(c.ble.isScanning ? "正在扫描…" : "扫描附近的 DG-LAB") { c.ble.scan() }
+                                .disabled(c.ble.isScanning || c.ble.isConnecting)
+                        }
+                        Label(c.capA > 0 || c.capB > 0 ? "第 2 步：已设置 A/B 上限 \(c.capA)/\(c.capB)" : "第 2 步：A/B 上限均为 0，请先设置", systemImage: c.capA > 0 || c.capB > 0 ? "checkmark.circle.fill" : "2.circle")
+                            .font(.subheadline)
+                        Button("设置通道上限和会话时长") { selectedTab = 1 }
+                            .buttonStyle(.bordered)
+                        Text(canStartLocal ? "条件已满足：点击启动并在弹窗中确认后才会授权输出。" : "未满足启动条件时按钮将引导下一步，不会自动增加强度。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else if c.role == .host {
+                        Label(c.ble.connected ? "蓝牙设备已就绪" : "请先连接 DG-LAB 蓝牙设备", systemImage: "antenna.radiowaves.left.and.right")
+                        if !c.ble.connected { Button("扫描并连接设备") { c.ble.scan() }.disabled(c.ble.isScanning || c.ble.isConnecting) }
+                        Button(c.bridge.connected ? "Telegram 桥接已连接" : "连接 Mac Telegram 桥接") { selectedTab = 4 }
+                            .buttonStyle(.borderedProminent)
+                        Text("作为蓝牙主机时，远程请求还需要在这台 iPhone 上单独确认。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Label(c.bridge.connected ? "Mac 桥接已连接" : "Mac 桥接未连接", systemImage: "network")
+                        Button(c.bridge.connected ? "进入远程会话控制" : "连接 Mac 控制器") {
+                            selectedTab = c.bridge.connected ? 1 : 4
+                        }.buttonStyle(.borderedProminent)
+                        if !c.bridge.connected {
+                            Text("请在 Telegram 页面填写 Mac 的局域网 ws:// 地址与桥接密钥。")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                 }.dgCard()
                 HStack(spacing: 12) {
                     MetricBlock(title: "A 通道", value: "\(c.strengthA)", sub: "本地上限 \(c.capA)")
@@ -104,6 +163,12 @@ struct DashboardPage: View {
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(.horizontal, 16).padding(.bottom, 28)
         }.navigationTitle("总览").navigationBarTitleDisplayMode(.inline)
+        .alert("确认启动本地会话？", isPresented: $showStartConfirmation) {
+            Button("取消", role: .cancel) { }
+            Button("确认授权启动") { c.startLocalSession() }
+        } message: {
+            Text("只有连接设备且明确设置通道上限之后才能授权；这是一次本地会话确认。设备最大软件数值不是人体安全阈值。")
+        }
     }
 }
 
@@ -131,12 +196,19 @@ struct BluetoothCard: View {
                         Spacer()
                         Text("连接").font(.footnote.bold())
                     }
-                }.disabled(c.ble.connected)
+                }.disabled(c.ble.connected || c.ble.isConnecting)
+            }
+            if c.ble.isConnecting {
+                ProgressView("正在建立 BLE 连接与检查特征值…")
             }
             if c.ble.connected {
                 Button("停止并断开设备", role: .destructive) { c.disconnectDevice() }
             }
             if let error = c.ble.lastError { Text(error).font(.caption).foregroundStyle(.red) }
+            if !c.ble.connected && !c.ble.isScanning && c.ble.detected.isEmpty {
+                Text("没有扫描到设备。请确认设备已开机、蓝牙已授权，并且 Mac/其他手机未占用此设备。")
+                    .font(.caption).foregroundStyle(.orange)
+            }
             Text("同一台 DG-LAB 只能由一个蓝牙主机占用；iPhone 直连前请断开 MBP 的 BLE 连接。")
                 .font(.caption2).foregroundStyle(.secondary)
         }.dgCard()
